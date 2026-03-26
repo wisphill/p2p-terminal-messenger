@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/url"
 	"os"
 	"sync"
@@ -14,14 +15,20 @@ import (
 )
 
 type Signal struct {
+	// common fields
 	To   string `json:"to"`
 	Data string `json:"data"`
+	Type string `json:"type"`
+
+	// specific fields
+	RandomId int `json:"random_id"`
 }
 
 func main() {
 	id := os.Args[1]
 	peer := os.Args[2]
 	server := os.Args[3]
+	clientInitialId := rand.Int()
 
 	u := url.URL{Scheme: "ws", Host: server, Path: "/ws"}
 	q := u.Query()
@@ -54,11 +61,11 @@ func main() {
 	// dc is written from two goroutines (OnDataChannel callback, offerer setup)
 	// and read from the main goroutine — guard with a mutex.
 	var (
-		dc      *webrtc.DataChannel
-		dcMu    sync.Mutex
-		dcReady = make(chan struct{})
+		dc   *webrtc.DataChannel
+		dcMu sync.Mutex
 	)
 
+	// to set the data channel
 	attachDataChannel := func(ch *webrtc.DataChannel) {
 		dcMu.Lock()
 		dc = ch
@@ -68,14 +75,13 @@ func main() {
 		})
 		ch.OnOpen(func() {
 			fmt.Println("--- Connection Established! You can now type messages ---")
-			close(dcReady)
 		})
 		if ch.ReadyState() == webrtc.DataChannelStateOpen {
 			fmt.Println("--- Connection Established! You can now type messages ---")
-			close(dcReady)
 		}
 	}
 
+	// for clients as answerer
 	pc.OnDataChannel(func(remote *webrtc.DataChannel) {
 		attachDataChannel(remote)
 	})
@@ -111,12 +117,38 @@ func main() {
 		pendingCandidates = nil
 	}
 
+	// handling the websocket for the signaling server
 	go func() {
 		for {
 			var s Signal
 			if err := ws.ReadJSON(&s); err != nil {
 				fmt.Println("WebSocket read error:", err)
 				break
+			}
+
+			if s.Type != "" && s.Type == "choosing_offerer" && clientInitialId < s.RandomId {
+				log.Printf("The client %v is the offerer to establish the data connection", clientInitialId)
+				// This client is the offerer: create the data channel and send the offer.
+				ch, err := pc.CreateDataChannel("chat", nil)
+				if err != nil {
+					panic(fmt.Sprintf("failed to create data channel: %v", err))
+				}
+				attachDataChannel(ch) // assigns into dc under dcMu
+
+				offer, err := pc.CreateOffer(nil)
+				if err != nil {
+					panic(fmt.Sprintf("CreateOffer error: %v", err))
+				}
+				if err := pc.SetLocalDescription(offer); err != nil {
+					panic(fmt.Sprintf("SetLocalDescription error: %v", err))
+				}
+				offerBytes, err := json.Marshal(offer)
+				if err != nil {
+					panic(fmt.Sprintf("Marshal offer error: %v", err))
+				}
+				if err := wsWriteJSON(Signal{To: peer, Data: string(offerBytes)}); err != nil {
+					panic(fmt.Sprintf("Error sending offer: %v", err))
+				}
 			}
 
 			var desc webrtc.SessionDescription
@@ -172,28 +204,9 @@ func main() {
 		}
 	}()
 
-	if id < peer {
-		// Offerer: create the data channel and send the offer.
-		ch, err := pc.CreateDataChannel("chat", nil)
-		if err != nil {
-			panic(fmt.Sprintf("failed to create data channel: %v", err))
-		}
-		attachDataChannel(ch) // assigns into dc under dcMu
-
-		offer, err := pc.CreateOffer(nil)
-		if err != nil {
-			panic(fmt.Sprintf("CreateOffer error: %v", err))
-		}
-		if err := pc.SetLocalDescription(offer); err != nil {
-			panic(fmt.Sprintf("SetLocalDescription error: %v", err))
-		}
-		offerBytes, err := json.Marshal(offer)
-		if err != nil {
-			panic(fmt.Sprintf("Marshal offer error: %v", err))
-		}
-		if err := wsWriteJSON(Signal{To: peer, Data: string(offerBytes)}); err != nil {
-			panic(fmt.Sprintf("Error sending offer: %v", err))
-		}
+	// after create web socket connection with the signaling server, we need to send a message to the signal server
+	if err := wsWriteJSON(Signal{To: peer, RandomId: clientInitialId, Type: "choosing_offerer", Data: ""}); err != nil {
+		panic(fmt.Sprintf("Error while sending signal to choose the offerer: %v", err))
 	}
 
 	// Answerer: dc will be set when OnDataChannel fires.

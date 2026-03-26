@@ -9,10 +9,11 @@ import (
 )
 
 type Message struct {
-	Type string `json:"type"`
-	From string `json:"from"`
-	To   string `json:"to"`
-	Data string `json:"data"`
+	Type     string `json:"type"`
+	From     string `json:"from"`
+	To       string `json:"to"`
+	RandomId int    `json:"random_id"`
+	Data     string `json:"data"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -23,7 +24,6 @@ var peers = make(map[string]*websocket.Conn)
 var mu sync.Mutex
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-
 	id := r.URL.Query().Get("id")
 	if id == "" {
 		http.Error(w, "missing id", 400)
@@ -55,6 +55,13 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		err := conn.ReadJSON(&msg)
 		if err != nil {
+			// Check if the error is a normal or abnormal closure
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("Connection error for %s: %v", id, err)
+			} else {
+				log.Printf("Peer %s disconnected normally %v %v", id, msg, err)
+			}
+
 			return
 		}
 
@@ -69,10 +76,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-
 	http.HandleFunc("/ws", wsHandler)
-
 	log.Println("signaling server running on :8080")
-
 	http.ListenAndServe(":8080", nil)
 }
