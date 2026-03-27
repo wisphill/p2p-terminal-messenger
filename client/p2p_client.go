@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
-	"log"
 	"net/url"
 	"os"
 	"p2p-terminal-messenger/internal"
@@ -49,13 +47,13 @@ func handlingWsMessages(ws *websocket.Conn, id string) error {
 	for {
 		var s Signal
 		if err := ws.ReadJSON(&s); err != nil {
-			fmt.Println("WebSocket read error:", err)
+			logger.Errorf("WebSocket read error: %v", err)
 			break
 		}
 
 		// create a list of data channel to the list
 		if s.Type != "" && s.Type == "new_peer" {
-			fmt.Printf("New peer %v is just joined \n ", s.From)
+			logger.Infof("New peer %v is just joined", s.From)
 			continue
 		}
 
@@ -66,15 +64,15 @@ func handlingWsMessages(ws *websocket.Conn, id string) error {
 				// TODO: data channel here
 				_, _, offerBytes, err := createDataChanel(ws, id, peer)
 				if err != nil {
-					fmt.Errorf("Error while creating chat data channel with peers")
-					continue
+					logger.Errorf("Error while creating chat data channel with peers")
+					return err
 				}
 
-				fmt.Printf("Sending offer to peer %v \n", peer)
+				logger.Infof("Sending offer to peer %v", peer)
 				// send offer to peers to connect
 				if err := sendWsMessage(ws, Signal{From: id, To: peer, Data: string(offerBytes)}); err != nil {
-					fmt.Errorf("Error while sending offer to the signaling server")
-					continue
+					logger.Errorf("Error while sending offer to the signaling server")
+					return err
 				}
 			}
 		}
@@ -84,7 +82,7 @@ func handlingWsMessages(ws *websocket.Conn, id string) error {
 			drainCandidateWrapper := func() {
 				peerM, ok := peerConnectionMap[s.From]
 				if !ok {
-					fmt.Printf("Peer %s does not exist!\n", s.From)
+					logger.Errorf("Peer %s does not exist!", s.From)
 					return
 				}
 				peerM.candidateMu.Lock()
@@ -95,47 +93,48 @@ func handlingWsMessages(ws *websocket.Conn, id string) error {
 			if desc.Type == webrtc.SDPTypeOffer {
 				pc, err := createPeerConnection(ws, id, s.From)
 				if err != nil {
-					fmt.Println("create peer connection error:", err)
-					continue
+					logger.Errorf("create peer connection error: %v", err)
+					return err
 				}
 
 				if err := pc.SetRemoteDescription(desc); err != nil {
-					fmt.Println("SetRemoteDescription error:", err)
-					continue
+					logger.Errorf("SetRemoteDescription error: %v", err)
+					return err
 				}
 				answer, err := pc.CreateAnswer(nil)
 				if err != nil {
-					fmt.Println("CreateAnswer error:", err)
-					continue
+					logger.Errorf("CreateAnswer error: %v", err)
+					return err
 				}
 				if err := pc.SetLocalDescription(answer); err != nil {
-					fmt.Println("SetLocalDescription error:", err)
-					continue
+					logger.Errorf("SetLocalDescription error: %v", err)
+					return err
 				}
 				ansBytes, err := json.Marshal(answer)
 				if err != nil {
-					fmt.Println("Marshal answer error:", err)
-					continue
+					logger.Errorf("Marshal answer error: %v", err)
+					return err
 				}
 				if err := sendWsMessage(ws, Signal{From: id, To: s.From, Data: string(ansBytes)}); err != nil {
-					fmt.Println("Error sending answer:", err)
+					logger.Errorf("Error sending answer: %v", err)
+					return err
 				}
 
 				drainCandidateWrapper()
 			} else if desc.Type == webrtc.SDPTypeAnswer {
 				peerM, ok := peerConnectionMap[s.From]
 				if !ok {
-					fmt.Printf("Peer %s does not exist!\n", s.From)
-					continue
+					logger.Errorf("Peer %s does not exist!", s.From)
+					return err
 				}
 				if err := peerM.connection.SetRemoteDescription(desc); err != nil {
-					fmt.Println("SetRemoteDescription error:", err)
-					continue
+					logger.Errorf("SetRemoteDescription error: %v", err)
+					return err
 				}
 				drainCandidateWrapper()
 				continue
 			} else {
-				fmt.Errorf("This type is not supported, only accepting the offer at the moment")
+				logger.Errorf("This type is not supported, only accepting the offer at the moment")
 				continue
 			}
 
@@ -146,16 +145,18 @@ func handlingWsMessages(ws *websocket.Conn, id string) error {
 		if err := json.Unmarshal([]byte(s.Data), &cand); err == nil {
 			peerM, ok := peerConnectionMap[s.From]
 			if !ok {
-				fmt.Printf("Peer %s does not exist!\n", s.From)
-				continue
+				logger.Errorf("Peer %s does not exist!", s.From)
+				return err
 			}
 			peerM.candidateMu.Lock()
 			if peerM.remoteDescSet {
 				if err := peerM.connection.AddICECandidate(cand); err != nil {
-					fmt.Println("AddICECandidate error:", err)
+					logger.Errorf("Add ICE candidate error: %v", err)
+					peerM.candidateMu.Unlock()
+					return err
 				}
 			} else {
-				fmt.Println("Append more candidates to the pending list")
+				logger.Infof("Append more candidates to the pending list")
 				peerM.pendingCandidates = append(peerM.pendingCandidates, cand)
 			}
 			peerM.candidateMu.Unlock()
@@ -174,7 +175,7 @@ func createPeerConnection(ws *websocket.Conn, id string, peer string) (*webrtc.P
 
 	pc, err := webrtc.NewPeerConnection(config)
 	if err != nil {
-		log.Fatalf("failed to create peer connection: %v", err)
+		logger.Fatalf("failed to create peer connection: %v", err)
 	}
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -183,11 +184,12 @@ func createPeerConnection(ws *websocket.Conn, id string, peer string) (*webrtc.P
 		}
 		data, err := json.Marshal(c.ToJSON())
 		if err != nil {
-			fmt.Println("Error marshalling ICE candidate:", err)
+			logger.Errorf("Error marshalling ICE candidate: %v", err)
 			return
 		}
 		if err := sendWsMessage(ws, Signal{From: id, To: peer, Data: string(data)}); err != nil {
-			fmt.Println("Error sending ICE candidate:", err)
+			logger.Errorf("Error sending ICE candidate: %v", err)
+			return
 		}
 	})
 
@@ -200,13 +202,13 @@ func createPeerConnection(ws *websocket.Conn, id string, peer string) (*webrtc.P
 
 	pc.OnDataChannel(func(remote *webrtc.DataChannel) {
 		remote.OnMessage(func(msg webrtc.DataChannelMessage) {
-			fmt.Println("peer:", string(msg.Data))
+			logger.Infof("peer: %s", string(msg.Data))
 		})
 		remote.OnOpen(func() {
-			fmt.Println("--- Connection Established! You can now type messages ---")
+			logger.Infof("--- Connection Established! You can now type messages ---")
 		})
 		if remote.ReadyState() == webrtc.DataChannelStateOpen {
-			fmt.Println("--- Connection Established! You can now type messages ---")
+			logger.Infof("--- Connection Established! You can now type messages ---")
 		}
 		peerConnectionMap[peer].dataChanel = remote
 	})
@@ -217,14 +219,14 @@ func createPeerConnection(ws *websocket.Conn, id string, peer string) (*webrtc.P
 func drainPeerCandidates(peer string) {
 	peerM, ok := peerConnectionMap[peer]
 	if !ok {
-		fmt.Printf("Peer %s does not exist!\n", peer)
+		logger.Errorf("Peer %s does not exist!", peer)
 		return
 	}
 
 	for _, cand := range peerM.pendingCandidates {
-		fmt.Println("Drainnnn candidatessssss ", cand)
+		logger.Infof("Draining candidate: %+v", cand)
 		if err := peerM.connection.AddICECandidate(cand); err != nil {
-			fmt.Println("AddICECandidate error:", err)
+			logger.Errorf("AddICECandidate error: %v", err)
 		}
 	}
 	peerM.pendingCandidates = nil
@@ -233,7 +235,7 @@ func drainPeerCandidates(peer string) {
 func createDataChanel(ws *websocket.Conn, id string, peer string) (*webrtc.PeerConnection, *webrtc.DataChannel, []byte, error) {
 	pc, err := createPeerConnection(ws, id, peer)
 	if err != nil {
-		log.Fatalf("failed to create peer connection: %v", err)
+		logger.Fatalf("failed to create peer connection: %v", err)
 	}
 
 	ch, err := pc.CreateDataChannel("chat", nil)
@@ -244,7 +246,7 @@ func createDataChanel(ws *websocket.Conn, id string, peer string) (*webrtc.PeerC
 
 	// events for data channels
 	ch.OnMessage(func(msg webrtc.DataChannelMessage) {
-		logger.Infof("peer: ", string(msg.Data))
+		logger.Infof("peer: %s", string(msg.Data))
 	})
 	ch.OnOpen(func() {
 		logger.Infof("connection with peer %s is established! You can send some messages from now", peer)
