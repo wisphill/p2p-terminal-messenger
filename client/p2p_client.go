@@ -2,16 +2,19 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/url"
 	"os"
+	"p2p-terminal-messenger/internal"
 	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
+	"go.uber.org/zap"
 )
 
 type Signal struct {
@@ -32,6 +35,7 @@ type Peer struct {
 
 var (
 	peerConnectionMap map[string]*Peer
+	logger            *zap.SugaredLogger
 )
 
 func sendWsMessage(ws *websocket.Conn, v any) error {
@@ -58,6 +62,7 @@ func handlingWsMessages(ws *websocket.Conn, id string) error {
 		// getting this message in the first time of the connection creation
 		if s.Type != "" && s.Type == "online_list" {
 			currentPeers := strings.Split(s.Data, ";")
+			fmt.Println("????", len(currentPeers))
 			for _, peer := range currentPeers {
 				// TODO: data channel here
 				_, _, offerBytes, err := createDataChanel(ws, id, peer)
@@ -234,31 +239,42 @@ func createDataChanel(ws *websocket.Conn, id string, peer string) (*webrtc.PeerC
 
 	ch, err := pc.CreateDataChannel("chat", nil)
 	if err != nil {
-		panic(fmt.Sprintf("failed to create data channel: %v", err))
+		logger.Errorf("failed to create data channel: %v", err)
+		return nil, nil, nil, err
 	}
 
 	// events for data channels
 	ch.OnMessage(func(msg webrtc.DataChannelMessage) {
-		fmt.Println("peer:", string(msg.Data))
+		logger.Infof("peer: ", string(msg.Data))
 	})
 	ch.OnOpen(func() {
-		fmt.Println("--- Connection Established! You can now type messages ---")
+		logger.Infof("connection with peer %s is established! You can send some messages from now", peer)
 	})
 
 	peerConnectionMap[peer].dataChanel = ch
 
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
-		panic(fmt.Sprintf("CreateOffer error: %v", err))
+		logger.Errorf("failed to create data channel: %v", err)
+		return nil, nil, nil, err
 	}
 	if err := pc.SetLocalDescription(offer); err != nil {
-		panic(fmt.Sprintf("SetLocalDescription error: %v", err))
+		logger.Errorf("failed to set the local description for the peer connection: %v", err)
+		return nil, nil, nil, err
 	}
 	offerBytes, err := json.Marshal(offer)
 	if err != nil {
-		panic(fmt.Sprintf("Marshal offer error: %v", err))
+		logger.Errorf("failed to marshall offer data: %v", err)
+		return nil, nil, nil, err
 	}
 	return pc, ch, offerBytes, err
+}
+
+func init() {
+	internal.Init()
+
+	ctx := context.Background()
+	logger = internal.LoggerFromContext(ctx)
 }
 
 func main() {
@@ -272,7 +288,7 @@ func main() {
 
 	ws, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
-		panic(err)
+		logger.Fatalf("Error while dialing to the Signaling websocket server")
 	}
 
 	peerConnectionMap = make(map[string]*Peer)
@@ -283,14 +299,14 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		text := scanner.Text()
-		for _, peer := range peerConnectionMap {
+		for peerName, peer := range peerConnectionMap {
 			readyDc := peer.dataChanel
 			if readyDc == nil {
-				fmt.Println("(connection not ready yet)")
+				logger.Infof("connection (peer %s) is not ready yet!", peerName)
 				continue
 			}
 			if err := readyDc.SendText(text); err != nil {
-				fmt.Printf("Error sending text: %v\n", err)
+				logger.Errorf("Error while sending your message! %v", err)
 			}
 		}
 	}
