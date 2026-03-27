@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -23,6 +24,7 @@ var upgrader = websocket.Upgrader{
 var peers = make(map[string]*websocket.Conn)
 var mu sync.Mutex
 
+// TODO: handle disconnected conn
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
@@ -37,7 +39,29 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
+
+	// send current peers list
+	var onlinePeers []string
+	for peerID := range peers {
+		onlinePeers = append(onlinePeers, peerID)
+	}
+	listMsg := map[string]interface{}{
+		"type": "online_list",
+		"data": strings.Join(onlinePeers, ";"), // Gửi mảng string IDs
+	}
+	conn.WriteJSON(listMsg)
+
 	peers[id] = conn
+	// notify the newcomer to the old peers
+	joinMsg := Message{
+		Type: "new_peer",
+		From: id,
+	}
+	for key, peerConn := range peers {
+		if key != id {
+			peerConn.WriteJSON(joinMsg)
+		}
+	}
 	mu.Unlock()
 
 	log.Println("peer connected:", id)

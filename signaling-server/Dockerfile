@@ -5,7 +5,7 @@ COPY go.mod go.sum ./
 RUN ls -la
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o signaling-server ./signaling-server/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o signaling-server ./signaling-server
 
 # Step 2: Run stage as non-root user
 FROM alpine:latest
