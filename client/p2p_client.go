@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/url"
 	"os"
 	"strings"
@@ -21,10 +20,19 @@ type Signal struct {
 	Data string `json:"data"`
 	Type string `json:"type"`
 	From string `json:"from"`
-
-	// specific fields
-	RandomId int `json:"random_id"`
 }
+
+type Peer struct {
+	connection        *webrtc.PeerConnection
+	candidateMu       sync.Mutex
+	pendingCandidates []webrtc.ICECandidateInit
+	remoteDescSet     bool
+	dataChanel        *webrtc.DataChannel
+}
+
+var (
+	peerConnectionMap map[string]*Peer
+)
 
 func sendWsMessage(ws *websocket.Conn, v any) error {
 	var wsMu sync.Mutex
@@ -33,7 +41,7 @@ func sendWsMessage(ws *websocket.Conn, v any) error {
 	return ws.WriteJSON(v)
 }
 
-func handlingWsMessages(ws *websocket.Conn) error {
+func handlingWsMessages(ws *websocket.Conn, id string) error {
 	for {
 		var s Signal
 		if err := ws.ReadJSON(&s); err != nil {
@@ -52,7 +60,7 @@ func handlingWsMessages(ws *websocket.Conn) error {
 			currentPeers := strings.Split(s.Data, ";")
 			for _, peer := range currentPeers {
 				// TODO: data channel here
-				_, _, offerBytes, err := createDataChanel()
+				_, _, offerBytes, err := createDataChanel(ws, id, peer)
 				if err != nil {
 					fmt.Errorf("Error while creating chat data channel with peers")
 					continue
@@ -60,18 +68,100 @@ func handlingWsMessages(ws *websocket.Conn) error {
 
 				fmt.Printf("Sending offer to peer %v \n", peer)
 				// send offer to peers to connect
-				if err := sendWsMessage(ws, Signal{To: peer, Data: string(offerBytes)}); err != nil {
+				if err := sendWsMessage(ws, Signal{From: id, To: peer, Data: string(offerBytes)}); err != nil {
 					fmt.Errorf("Error while sending offer to the signaling server")
 					continue
 				}
 			}
+		}
+
+		var desc webrtc.SessionDescription
+		if err := json.Unmarshal([]byte(s.Data), &desc); err == nil && desc.SDP != "" {
+			drainCandidateWrapper := func() {
+				peerM, ok := peerConnectionMap[s.From]
+				if !ok {
+					fmt.Printf("Peer %s does not exist!\n", s.From)
+					return
+				}
+				peerM.candidateMu.Lock()
+				peerM.remoteDescSet = true
+				drainPeerCandidates(s.From)
+				peerM.candidateMu.Unlock()
+			}
+			if desc.Type == webrtc.SDPTypeOffer {
+				pc, err := createPeerConnection(ws, id, s.From)
+				if err != nil {
+					fmt.Println("create peer connection error:", err)
+					continue
+				}
+
+				if err := pc.SetRemoteDescription(desc); err != nil {
+					fmt.Println("SetRemoteDescription error:", err)
+					continue
+				}
+				answer, err := pc.CreateAnswer(nil)
+				if err != nil {
+					fmt.Println("CreateAnswer error:", err)
+					continue
+				}
+				if err := pc.SetLocalDescription(answer); err != nil {
+					fmt.Println("SetLocalDescription error:", err)
+					continue
+				}
+				ansBytes, err := json.Marshal(answer)
+				if err != nil {
+					fmt.Println("Marshal answer error:", err)
+					continue
+				}
+				if err := sendWsMessage(ws, Signal{From: id, To: s.From, Data: string(ansBytes)}); err != nil {
+					fmt.Println("Error sending answer:", err)
+				}
+
+				drainCandidateWrapper()
+			} else if desc.Type == webrtc.SDPTypeAnswer {
+				peerM, ok := peerConnectionMap[s.From]
+				if !ok {
+					fmt.Printf("Peer %s does not exist!\n", s.From)
+					continue
+				}
+				if err := peerM.connection.SetRemoteDescription(desc); err != nil {
+					fmt.Println("SetRemoteDescription error:", err)
+					continue
+				}
+				drainCandidateWrapper()
+				continue
+			} else {
+				fmt.Errorf("This type is not supported, only accepting the offer at the moment")
+				continue
+			}
+
+		}
+
+		// parser 3
+		var cand webrtc.ICECandidateInit
+		if err := json.Unmarshal([]byte(s.Data), &cand); err == nil {
+			peerM, ok := peerConnectionMap[s.From]
+			if !ok {
+				fmt.Printf("Peer %s does not exist!\n", s.From)
+				continue
+			}
+			peerM.candidateMu.Lock()
+			if peerM.remoteDescSet {
+				if err := peerM.connection.AddICECandidate(cand); err != nil {
+					fmt.Println("AddICECandidate error:", err)
+				}
+			} else {
+				fmt.Println("Append more candidates to the pending list")
+				peerM.pendingCandidates = append(peerM.pendingCandidates, cand)
+			}
+			peerM.candidateMu.Unlock()
 		}
 	}
 
 	return nil
 }
 
-func createDataChanel() (*webrtc.PeerConnection, *webrtc.DataChannel, []byte, error) {
+func createPeerConnection(ws *websocket.Conn, id string, peer string) (*webrtc.PeerConnection, error) {
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -79,6 +169,65 @@ func createDataChanel() (*webrtc.PeerConnection, *webrtc.DataChannel, []byte, er
 	}
 
 	pc, err := webrtc.NewPeerConnection(config)
+	if err != nil {
+		log.Fatalf("failed to create peer connection: %v", err)
+	}
+
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			return
+		}
+		data, err := json.Marshal(c.ToJSON())
+		if err != nil {
+			fmt.Println("Error marshalling ICE candidate:", err)
+			return
+		}
+		if err := sendWsMessage(ws, Signal{From: id, To: peer, Data: string(data)}); err != nil {
+			fmt.Println("Error sending ICE candidate:", err)
+		}
+	})
+
+	// set the pc to the connection map
+	peerConnectionMap[peer] = &Peer{
+		connection:        pc,
+		pendingCandidates: []webrtc.ICECandidateInit{},
+		remoteDescSet:     false,
+	}
+
+	pc.OnDataChannel(func(remote *webrtc.DataChannel) {
+		remote.OnMessage(func(msg webrtc.DataChannelMessage) {
+			fmt.Println("peer:", string(msg.Data))
+		})
+		remote.OnOpen(func() {
+			fmt.Println("--- Connection Established! You can now type messages ---")
+		})
+		if remote.ReadyState() == webrtc.DataChannelStateOpen {
+			fmt.Println("--- Connection Established! You can now type messages ---")
+		}
+		peerConnectionMap[peer].dataChanel = remote
+	})
+
+	return pc, err
+}
+
+func drainPeerCandidates(peer string) {
+	peerM, ok := peerConnectionMap[peer]
+	if !ok {
+		fmt.Printf("Peer %s does not exist!\n", peer)
+		return
+	}
+
+	for _, cand := range peerM.pendingCandidates {
+		fmt.Println("Drainnnn candidatessssss ", cand)
+		if err := peerM.connection.AddICECandidate(cand); err != nil {
+			fmt.Println("AddICECandidate error:", err)
+		}
+	}
+	peerM.pendingCandidates = nil
+}
+
+func createDataChanel(ws *websocket.Conn, id string, peer string) (*webrtc.PeerConnection, *webrtc.DataChannel, []byte, error) {
+	pc, err := createPeerConnection(ws, id, peer)
 	if err != nil {
 		log.Fatalf("failed to create peer connection: %v", err)
 	}
@@ -96,6 +245,8 @@ func createDataChanel() (*webrtc.PeerConnection, *webrtc.DataChannel, []byte, er
 		fmt.Println("--- Connection Established! You can now type messages ---")
 	})
 
+	peerConnectionMap[peer].dataChanel = ch
+
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		panic(fmt.Sprintf("CreateOffer error: %v", err))
@@ -110,33 +261,9 @@ func createDataChanel() (*webrtc.PeerConnection, *webrtc.DataChannel, []byte, er
 	return pc, ch, offerBytes, err
 }
 
-// func initPeerDataChannel() {
-// 	log.Printf("The client %v is the offerer to establish the data connection", clientInitialId)
-// 	// This client is the offerer: create the data channel and send the offer.
-// 	ch, err := pc.CreateDataChannel("chat", nil)
-// 	if err != nil {
-// 		panic(fmt.Sprintf("failed to create data channel: %v", err))
-// 	}
-// 	attachDataChannel(ch) // assigns into dc under dcMu
-
-// 	offer, err := pc.CreateOffer(nil)
-// 	if err != nil {
-// 		panic(fmt.Sprintf("CreateOffer error: %v", err))
-// 	}
-// 	if err := pc.SetLocalDescription(offer); err != nil {
-// 		panic(fmt.Sprintf("SetLocalDescription error: %v", err))
-// 	}
-// 	offerBytes, err := json.Marshal(offer)
-// 	if err != nil {
-// 		panic(fmt.Sprintf("Marshal offer error: %v", err))
-// 	}
-// }
-
 func main() {
 	id := os.Args[1]
-	peer := os.Args[2]
-	server := os.Args[3]
-	clientInitialId := rand.Int()
+	server := os.Args[2]
 
 	u := url.URL{Scheme: "ws", Host: server, Path: "/ws"}
 	q := u.Query()
@@ -148,193 +275,23 @@ func main() {
 		panic(err)
 	}
 
-	var wsMu sync.Mutex
-	wsWriteJSON := func(v any) error {
-		wsMu.Lock()
-		defer wsMu.Unlock()
-		return ws.WriteJSON(v)
-	}
-
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.l.google.com:19302"}},
-		},
-	}
-
-	pc, err := webrtc.NewPeerConnection(config)
-	if err != nil {
-		log.Fatalf("failed to create peer connection: %v", err)
-	}
-
-	// dc is written from two goroutines (OnDataChannel callback, offerer setup)
-	// and read from the main goroutine — guard with a mutex.
-	var (
-		dc   *webrtc.DataChannel
-		dcMu sync.Mutex
-	)
-
-	// to set the data channel
-	attachDataChannel := func(ch *webrtc.DataChannel) {
-		dcMu.Lock()
-		dc = ch
-		dcMu.Unlock()
-		ch.OnMessage(func(msg webrtc.DataChannelMessage) {
-			fmt.Println("peer:", string(msg.Data))
-		})
-		ch.OnOpen(func() {
-			fmt.Println("--- Connection Established! You can now type messages ---")
-		})
-		if ch.ReadyState() == webrtc.DataChannelStateOpen {
-			fmt.Println("--- Connection Established! You can now type messages ---")
-		}
-	}
-
-	// for clients as answerer
-	pc.OnDataChannel(func(remote *webrtc.DataChannel) {
-		attachDataChannel(remote)
-	})
-
-	// peer connection event OnICECandidate: find the local candidate and send to the signaling channel
-	// for others to try to connect
-	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil {
-			return
-		}
-		data, err := json.Marshal(c.ToJSON())
-		if err != nil {
-			fmt.Println("Error marshalling ICE candidate:", err)
-			return
-		}
-		if err := wsWriteJSON(Signal{To: peer, Data: string(data)}); err != nil {
-			fmt.Println("Error sending ICE candidate:", err)
-		}
-	})
-
-	var (
-		pendingCandidates []webrtc.ICECandidateInit
-		candidateMu       sync.Mutex
-		remoteDescSet     bool
-	)
-
-	drainCandidates := func() {
-		for _, cand := range pendingCandidates {
-			if err := pc.AddICECandidate(cand); err != nil {
-				fmt.Println("AddICECandidate error:", err)
-			}
-		}
-		pendingCandidates = nil
-	}
-
-	go handlingWsMessages(ws)
-	// handling the websocket for the signaling server
-	go func() {
-		for {
-			var s Signal
-			if err := ws.ReadJSON(&s); err != nil {
-				fmt.Println("WebSocket read error:", err)
-				break
-			}
-
-			if s.Type != "" && s.Type == "choosing_offerer" {
-				fmt.Println("TEST for choosing offerer!!!")
-				if clientInitialId < s.RandomId {
-					log.Printf("The client %v is the offerer to establish the data connection", clientInitialId)
-					// This client is the offerer: create the data channel and send the offer.
-					ch, err := pc.CreateDataChannel("chat", nil)
-					if err != nil {
-						panic(fmt.Sprintf("failed to create data channel: %v", err))
-					}
-					attachDataChannel(ch) // assigns into dc under dcMu
-
-					offer, err := pc.CreateOffer(nil)
-					if err != nil {
-						panic(fmt.Sprintf("CreateOffer error: %v", err))
-					}
-					if err := pc.SetLocalDescription(offer); err != nil {
-						panic(fmt.Sprintf("SetLocalDescription error: %v", err))
-					}
-					offerBytes, err := json.Marshal(offer)
-					if err != nil {
-						panic(fmt.Sprintf("Marshal offer error: %v", err))
-					}
-					if err := wsWriteJSON(Signal{To: peer, Data: string(offerBytes)}); err != nil {
-						panic(fmt.Sprintf("Error sending offer: %v", err))
-					}
-				}
-
-			}
-
-			var desc webrtc.SessionDescription
-			if err := json.Unmarshal([]byte(s.Data), &desc); err == nil && desc.SDP != "" {
-				if desc.Type == webrtc.SDPTypeOffer {
-					if err := pc.SetRemoteDescription(desc); err != nil {
-						fmt.Println("SetRemoteDescription error:", err)
-						continue
-					}
-					answer, err := pc.CreateAnswer(nil)
-					if err != nil {
-						fmt.Println("CreateAnswer error:", err)
-						continue
-					}
-					if err := pc.SetLocalDescription(answer); err != nil {
-						fmt.Println("SetLocalDescription error:", err)
-						continue
-					}
-					ansBytes, err := json.Marshal(answer)
-					if err != nil {
-						fmt.Println("Marshal answer error:", err)
-						continue
-					}
-					if err := wsWriteJSON(Signal{To: peer, Data: string(ansBytes)}); err != nil {
-						fmt.Println("Error sending answer:", err)
-					}
-				} else {
-					if err := pc.SetRemoteDescription(desc); err != nil {
-						fmt.Println("SetRemoteDescription error:", err)
-						continue
-					}
-				}
-
-				candidateMu.Lock()
-				remoteDescSet = true
-				drainCandidates()
-				candidateMu.Unlock()
-				continue
-			}
-
-			var cand webrtc.ICECandidateInit
-			if err := json.Unmarshal([]byte(s.Data), &cand); err == nil {
-				candidateMu.Lock()
-				if remoteDescSet {
-					if err := pc.AddICECandidate(cand); err != nil {
-						fmt.Println("AddICECandidate error:", err)
-					}
-				} else {
-					pendingCandidates = append(pendingCandidates, cand)
-				}
-				candidateMu.Unlock()
-			}
-		}
-	}()
-
-	// after create web socket connection with the signaling server, we need to send a message to the signal server
-	if err := wsWriteJSON(Signal{To: peer, RandomId: clientInitialId, Type: "choosing_offerer", Data: ""}); err != nil {
-		panic(fmt.Sprintf("Error while sending signal to choose the offerer: %v", err))
-	}
+	peerConnectionMap = make(map[string]*Peer)
+	go handlingWsMessages(ws, id)
 
 	// Answerer: dc will be set when OnDataChannel fires.
 	// Now sending data via p2p connection using webRTC
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		dcMu.Lock()
-		ready := dc
-		dcMu.Unlock()
-		if ready == nil {
-			fmt.Println("(connection not ready yet)")
-			continue
-		}
-		if err := ready.SendText(scanner.Text()); err != nil {
-			fmt.Printf("Error sending text: %v\n", err)
+		text := scanner.Text()
+		for _, peer := range peerConnectionMap {
+			readyDc := peer.dataChanel
+			if readyDc == nil {
+				fmt.Println("(connection not ready yet)")
+				continue
+			}
+			if err := readyDc.SendText(text); err != nil {
+				fmt.Printf("Error sending text: %v\n", err)
+			}
 		}
 	}
 }
