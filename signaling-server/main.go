@@ -45,14 +45,18 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	for peerID := range peers {
 		onlinePeers = append(onlinePeers, peerID)
 	}
-	listMsg := map[string]interface{}{
-		"type": "online_list",
-		"data": strings.Join(onlinePeers, ";"), // Gửi mảng string IDs
-	}
-	conn.WriteJSON(listMsg)
 
-	peers[id] = conn
+	peersString := strings.Join(onlinePeers, ";")
+	if peersString != "" {
+		listMsg := map[string]interface{}{
+			"type": "online_list",
+			"data": peersString,
+		}
+		conn.WriteJSON(listMsg)
+	}
+
 	// notify the newcomer to the old peers
+	peers[id] = conn
 	joinMsg := Message{
 		Type: "new_peer",
 		From: id,

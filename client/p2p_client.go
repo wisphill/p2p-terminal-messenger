@@ -62,7 +62,6 @@ func handlingWsMessages(ws *websocket.Conn, id string) error {
 		// getting this message in the first time of the connection creation
 		if s.Type != "" && s.Type == "online_list" {
 			currentPeers := strings.Split(s.Data, ";")
-			fmt.Println("????", len(currentPeers))
 			for _, peer := range currentPeers {
 				// TODO: data channel here
 				_, _, offerBytes, err := createDataChanel(ws, id, peer)
